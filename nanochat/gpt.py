@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
-from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.optim import MuonAdamW, DistMuonAdamW, FSDPMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -136,11 +136,20 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self._use_activation_checkpointing = False  # set externally by training script
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def _forward_impl(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        if self._use_activation_checkpointing and self.training:
+            return torch.utils.checkpoint.checkpoint(
+                self._forward_impl, x, ve, cos_sin, window_size, kv_cache,
+                use_reentrant=False,
+            )
+        return self._forward_impl(x, ve, cos_sin, window_size, kv_cache)
 
 
 class GPT(nn.Module):
@@ -345,7 +354,7 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, distributed_strategy="ddp"):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -372,14 +381,30 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
+        # Note: under FSDP2, p.shape on a DTensor returns the global (logical) shape,
+        # so this shape-based grouping works correctly for both DDP and FSDP.
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
+            # FSDP2 shards on dim-0; shapes not divisible by world_size can't be sharded evenly.
+            # Route those to AdamW (affects only tiny params like ve_gate in shallow test models;
+            # for target depths d48+ all matrix shapes are divisible by 8).
+            if distributed_strategy == "fsdp" and shape[0] % world_size != 0:
+                param_groups.append(dict(
+                    kind='adamw', params=group_params, lr=matrix_lr,
+                    betas=adam_betas, eps=1e-10, weight_decay=weight_decay,
+                ))
+                continue
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
 
-        Factory = DistMuonAdamW if ddp else MuonAdamW
+        if distributed_strategy == "fsdp":
+            Factory = FSDPMuonAdamW
+        elif ddp:
+            Factory = DistMuonAdamW
+        else:
+            Factory = MuonAdamW
         optimizer = Factory(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]

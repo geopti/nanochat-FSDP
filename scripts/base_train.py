@@ -43,6 +43,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
+parser.add_argument("--distributed-strategy", type=str, default="ddp", choices=["ddp", "fsdp"], help="distributed training strategy: ddp (default) or fsdp (FSDP2 for 7B+ models)")
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
@@ -153,9 +154,38 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data # free up this memory after the copy
+    if args.distributed_strategy != "fsdp":
+        # DDP: load checkpoint directly into model before any wrapping
+        model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+        model.load_state_dict(model_data, strict=True, assign=True)
+        del model_data # free up this memory after the copy
+    else:
+        # FSDP: model state loaded after FSDP wrapping below; just load optimizer + meta here
+        _, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+
+# -----------------------------------------------------------------------------
+# FSDP2 wrapping (must happen after init_weights, before FP8 and torch.compile)
+
+if args.distributed_strategy == "fsdp":
+    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+    model.bfloat16()  # FSDP requires uniform dtype; some params (wte, value_embeds) init as bf16 on CUDA
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    # Enable activation checkpointing on all transformer blocks
+    for block in model.transformer.h:
+        block._use_activation_checkpointing = True
+    # Apply FSDP2 bottom-up: per-block first, then root wraps remaining params (embeddings, lm_head, scalars)
+    for block in model.transformer.h:
+        fully_shard(block, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
+    print0(f"✓ FSDP2 enabled: model sharded across {ddp_world_size} GPUs with activation checkpointing")
+
+    # If resuming, load checkpoint into FSDP model using distributed state dict utilities
+    if resuming:
+        from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
+        model_data_resume, _, _ = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=False)
+        set_model_state_dict(model, model_data_resume,
+            options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True))
+        del model_data_resume
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -309,11 +339,20 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    # Distributed strategy
+    distributed_strategy=args.distributed_strategy,
 )
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+    if args.distributed_strategy == "fsdp":
+        # PyTorch's load_state_dict casts optimizer states to param.dtype (bfloat16 under FSDP).
+        # Our optimizer stores states in FP32, so upcast them back.
+        for state in optimizer.state.values():
+            for k, v in list(state.items()):
+                if isinstance(v, torch.Tensor) and v.is_floating_point() and k != 'step':
+                    state[k] = v.float()
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
@@ -435,9 +474,12 @@ while True:
         })
         model.train()
 
-    # once in a while: sample from the model (only on master process)
+    # once in a while: sample from the model
     # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    # For FSDP2, all ranks must participate in model.forward() (all-gather requires all ranks);
+    # for DDP, only the master process needs to run this.
+    do_sample = args.sample_every > 0 and (last_step or (step > 0 and step % args.sample_every == 0))
+    if do_sample and (master_process or args.distributed_strategy == "fsdp"):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -458,10 +500,17 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        # Get model state dict: FSDP needs special handling to get full state dict on rank 0
+        if args.distributed_strategy == "fsdp":
+            from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+            model_sd = get_model_state_dict(orig_model,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        else:
+            model_sd = orig_model.state_dict()
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(), # model parameters
+            model_sd, # model parameters
             optimizer.state_dict(), # optimizer state
             { # metadata saved as json
                 "step": step,
@@ -491,6 +540,12 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        # FSDP gradient sync control: only sync on the last micro-step
+        if args.distributed_strategy == "fsdp":
+            is_last = (micro_step == grad_accum_steps - 1)
+            model.set_requires_gradient_sync(is_last)
+            if is_last:
+                model.set_is_last_backward(True)
         with autocast_ctx:
             loss = model(x, y)
         train_loss = loss.detach() # for logging

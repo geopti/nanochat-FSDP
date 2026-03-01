@@ -531,3 +531,263 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+# -----------------------------------------------------------------------------
+# FSDP2 version of the MuonAdamW optimizer.
+# Used for training with fully_shard() (FSDP2) on multiple GPUs.
+# Key difference from DistMuonAdamW: FSDP handles gradient reduction (reduce-scatter
+# during backward), so the optimizer receives already-reduced sharded gradients as DTensors.
+# AdamW operates directly on shards. Muon must all-gather for Newton-Schulz orthogonalization.
+
+@torch.compile(dynamic=False, fullgraph=True)
+def _fsdp_muon_ns_and_update(
+    nesterov_full: Tensor,          # (K, full_rows, cols) - all-gathered nesterov momentum
+    stacked_params: Tensor,         # (K, local_rows, cols) - sharded parameters
+    second_momentum_buffer: Tensor, # (K, local_rows, 1) or (K, 1, cols) - factored second moment (sharded for tall, full for wide)
+    lr_t: Tensor,                   # () - 0-D CPU tensor
+    wd_t: Tensor,                   # () - 0-D CPU tensor
+    beta2_t: Tensor,                # () - 0-D CPU tensor
+    ns_steps: int,
+    red_dim: int,
+    shard_start: int,               # start index into dim -2 for this rank's shard
+    shard_end: int,                  # end index into dim -2 for this rank's shard
+) -> None:
+    """
+    Fused FSDP Muon step: runs Newton-Schulz on full matrices, extracts this rank's shard,
+    applies variance reduction + cautious weight decay + parameter update on the shard.
+    """
+    # Polar Express on full (unsharded) matrices
+    X = nesterov_full.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    if nesterov_full.size(-2) > nesterov_full.size(-1):  # Tall matrix
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:  # Wide matrix
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+
+    # Extract this rank's shard of the orthogonalized output
+    g = X[:, shard_start:shard_end, :]
+
+    # Variance reduction on shard
+    # For tall matrices (red_dim=-1): v_mean over cols is correct on shard (each row is complete)
+    # For wide matrices (red_dim=-2): v_mean over local_rows is INCOMPLETE — needs all-reduce (done outside compile)
+    beta2 = beta2_t.to(second_momentum_buffer.dtype)  # FP32 to match FP32 second_momentum_buffer
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    # Cautious weight decay + parameter update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+class FSDPMuonAdamW(torch.optim.Optimizer):
+    """
+    Combined optimizer for FSDP2: Muon for 2D matrix params, AdamW for others.
+
+    Under FSDP2, parameters are DTensors sharded on dim-0. FSDP handles gradient
+    reduction (reduce-scatter during backward), so the optimizer receives already-reduced
+    sharded gradients.
+
+    AdamW: Operates directly on DTensor shards — element-wise ops work on shards
+    with no communication needed.
+
+    Muon: Must all-gather sharded data for Newton-Schulz orthogonalization:
+    1. Update sharded momentum buffer (element-wise lerp_ — works on shards)
+    2. Compute Nesterov on shards (element-wise — works on shards)
+    3. All-gather Nesterov result to full matrices — temporary buffer
+    4. Run Newton-Schulz on full matrices
+    5. Extract this rank's shard of the orthogonalized output
+    6. Variance reduction + cautious weight decay + parameter update on shard
+    7. Free the temporary full buffer
+
+    Momentum storage: Sharded (same layout as FSDP parameter shards). Only all-gathered
+    transiently during NS.
+
+    Second momentum buffer: For tall matrices (red_dim=-1), kept sharded since reduction
+    is over cols (complete on each shard). For wide matrices (red_dim=-2), also kept
+    sharded but requires an all-reduce correction since reduction is over rows (incomplete).
+    """
+    def __init__(self, param_groups: list[dict]):
+        super().__init__(param_groups, defaults={})
+        # 0-D CPU tensors to avoid torch.compile recompilation when values change
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+
+    def _step_adamw(self, group: dict) -> None:
+        """AdamW update for each param — operates on local shard tensors (not DTensors)."""
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            # Extract plain local tensors from DTensors to avoid DTensor mixed-dtype sharding issues
+            p_local = p._local_tensor if hasattr(p, '_local_tensor') else p
+            grad_local = p.grad._local_tensor if hasattr(p.grad, '_local_tensor') else p.grad
+            # Upcast grad to FP32 to match FP32 optimizer states
+            grad_fp32 = grad_local.to(torch.float32)
+            state = self.state[p]
+
+            # State init: FP32 plain tensors (not DTensors), matching original MuonAdamW precision
+            if not state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p_local, dtype=torch.float32)
+                state['exp_avg_sq'] = torch.zeros_like(p_local, dtype=torch.float32)
+            state['step'] += 1
+
+            # Fill 0-D tensors with current values
+            self._adamw_step_t.fill_(state['step'])
+            self._adamw_lr_t.fill_(group['lr'])
+            self._adamw_beta1_t.fill_(group['betas'][0])
+            self._adamw_beta2_t.fill_(group['betas'][1])
+            self._adamw_eps_t.fill_(group['eps'])
+            self._adamw_wd_t.fill_(group['weight_decay'])
+
+            # Fused update on local shard — p_local is BF16, grad/states are FP32
+            # p_local.mul_() and p_local.add_() downcast FP32→BF16 in-place
+            adamw_step_fused(
+                p_local, grad_fp32, state['exp_avg'], state['exp_avg_sq'],
+                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            )
+
+    def _step_muon(self, group: dict) -> None:
+        """
+        Muon update for all params in the group under FSDP2.
+        Params are DTensors sharded on dim-0. We must all-gather for Newton-Schulz.
+        """
+        params: list[Tensor] = group['params']
+        if not params:
+            return
+
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        # Under FSDP2, p.shape returns the global (logical) shape
+        p0 = params[0]
+        global_shape = p0.shape  # (full_rows, cols) — the logical shape
+        num_params = len(params)
+
+        # Get the local (sharded) tensor from the DTensor
+        # FSDP2 shards on dim-0, so local shape is (full_rows // world_size, cols)
+        local_rows = global_shape[-2] // world_size
+        cols = global_shape[-1]
+        full_rows = global_shape[-2]
+        device = p0.device
+        dtype = p0.dtype
+
+        # Shard boundaries for this rank
+        shard_start = rank * local_rows
+        shard_end = shard_start + local_rows
+
+        # Get or create group-level state (stored in first param's state)
+        state = self.state[p0]
+
+        # Momentum buffer: FP32 regardless of param dtype, matching original MuonAdamW precision
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(num_params, local_rows, cols, dtype=torch.float32, device=device)
+        momentum_buffer = state["momentum_buffer"]
+
+        # Determine reduction dimension
+        red_dim = -1 if full_rows >= cols else -2
+
+        # Second momentum buffer: FP32 for numerical stability
+        if "second_momentum_buffer" not in state:
+            if red_dim == -1:
+                # Tall matrices: reduce over cols, shape (K, local_rows, 1) — sharded
+                state["second_momentum_buffer"] = torch.zeros(num_params, local_rows, 1, dtype=torch.float32, device=device)
+            else:
+                # Wide matrices: reduce over rows, shape (K, 1, cols) — kept full
+                # (tiny: O(K * cols) vs O(K * rows * cols) for params)
+                state["second_momentum_buffer"] = torch.zeros(num_params, 1, cols, dtype=torch.float32, device=device)
+        second_momentum_buffer = state["second_momentum_buffer"]
+
+        # Stack sharded grads and params: extract local tensors from DTensors
+        # Upcast grads to FP32 so momentum updates stay in FP32
+        local_grads = torch.stack([p.grad._local_tensor if hasattr(p.grad, '_local_tensor') else p.grad for p in params]).float()
+        local_params = torch.stack([p._local_tensor if hasattr(p, '_local_tensor') else p for p in params])
+
+        # --- Momentum + Nesterov (element-wise on shards, no communication) ---
+        momentum = self._muon_momentum_t.to(local_grads.dtype)  # FP32
+        momentum_buffer.lerp_(local_grads, 1 - momentum)
+        nesterov_sharded = local_grads.lerp_(momentum_buffer, momentum)  # reuses local_grads buffer; FP32
+
+        # --- All-gather nesterov to full matrices for Newton-Schulz ---
+        nesterov_full = torch.empty(num_params, full_rows, cols, dtype=torch.float32, device=device)
+        dist.all_gather_into_tensor(
+            nesterov_full.view(num_params * full_rows, cols),
+            nesterov_sharded.contiguous().view(num_params * local_rows, cols),
+        )
+        # Reshape back: all_gather concatenates along dim 0, giving (world_size * K * local_rows, cols)
+        # We need to rearrange from [rank0_all_K, rank1_all_K, ...] to [K, full_rows, cols]
+        # all_gather_into_tensor concatenates shards: output[i*chunk:(i+1)*chunk] = rank i's data
+        # So output shape is (world_size * num_params * local_rows, cols)
+        # We need to reshape to (world_size, num_params, local_rows, cols) and permute to (num_params, world_size, local_rows, cols)
+        nesterov_full = nesterov_full.view(world_size, num_params, local_rows, cols).permute(1, 0, 2, 3).contiguous().view(num_params, full_rows, cols)
+
+        # --- Newton-Schulz + variance reduction + update (compiled kernel) ---
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, full_rows / cols)**0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+        self._muon_beta2_t.fill_(group["beta2"])
+
+        _fsdp_muon_ns_and_update(
+            nesterov_full,
+            local_params,
+            second_momentum_buffer,
+            self._muon_lr_t,
+            self._muon_wd_t,
+            self._muon_beta2_t,
+            group["ns_steps"],
+            red_dim,
+            shard_start,
+            shard_end,
+        )
+
+        # Wide matrix variance reduction fix: v_mean was computed over local_rows only,
+        # need to average across all ranks to get the correct global mean
+        if red_dim == -2:
+            dist.all_reduce(second_momentum_buffer, op=dist.ReduceOp.AVG)
+
+        # Free the temporary full buffer
+        del nesterov_full
+
+        # Copy updated local params back to DTensor parameters
+        for i, p in enumerate(params):
+            local_tensor = p._local_tensor if hasattr(p, '_local_tensor') else p
+            local_tensor.copy_(local_params[i])
+
+    @torch.no_grad()
+    def step(self):
+        # Fill momentum tensor once (same for all Muon groups)
+        for group in self.param_groups:
+            if group['kind'] == 'muon':
+                self._muon_momentum_t.fill_(group["momentum"])
+                break
+
+        for group in self.param_groups:
+            if group['kind'] == 'adamw':
+                self._step_adamw(group)
+            elif group['kind'] == 'muon':
+                self._step_muon(group)
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")

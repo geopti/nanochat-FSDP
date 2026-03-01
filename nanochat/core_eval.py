@@ -177,7 +177,8 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     if num_fewshot > 0:
         rng = random.Random(1234 + idx)
         available_indices = [i for i in range(len(data)) if i != idx]
-        fewshot_indices = rng.sample(available_indices, num_fewshot)
+        n_shot = min(num_fewshot, len(available_indices))  # cap when data is limited
+        fewshot_indices = rng.sample(available_indices, n_shot)
         fewshot_examples = [data[i] for i in fewshot_indices]
 
     # Render prompts and batch sequences based on task type
@@ -248,15 +249,22 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    n = len(data)
+    # Pad to a world_size multiple so every rank makes the same number of forward calls.
+    # FSDP2 triggers all-gather during each forward pass, requiring all ranks to participate;
+    # without padding, ranks with no assigned examples would deadlock NCCL.
+    padded_n = ((n + world_size - 1) // world_size) * world_size
+    correct = torch.zeros(padded_n, dtype=torch.float32, device=device)
     # stride the examples to each rank
-    for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
-        correct[idx] = float(is_correct)
+    for idx in range(rank, padded_n, world_size):
+        real_idx = idx % n  # wrap around so padding indices reuse valid data
+        is_correct = evaluate_example(real_idx, model, tokenizer, data, device, task_meta)
+        if idx < n:  # only record results for real (non-padding) examples
+            correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed
     if world_size > 1:
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
-    # compute the mean
-    mean_correct = correct.mean().item()
+    # compute the mean over real examples only
+    mean_correct = correct[:n].mean().item()
     return mean_correct
