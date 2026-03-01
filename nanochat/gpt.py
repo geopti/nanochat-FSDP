@@ -385,9 +385,13 @@ class GPT(nn.Module):
         # so this shape-based grouping works correctly for both DDP and FSDP.
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            # FSDP2 shards on dim-0; shapes not divisible by world_size can't be sharded evenly.
-            # Route those to AdamW (affects only tiny params like ve_gate in shallow test models;
-            # for target depths d48+ all matrix shapes are divisible by 8).
+            # FSDP2 shards on dim-0, so Muon's all-gather requires shape[0] % world_size == 0.
+            # The only affected parameter is ve_gate.weight, shape (n_kv_head, 32), where
+            # n_kv_head = depth // 2. For Muon to apply to ve_gate, depth must be a multiple
+            # of 2*world_size (e.g. multiple of 16 for 8 GPUs: d=16, 32, 48, 64 are fine).
+            # For other depths, ve_gate falls back to AdamW — inconsequential since ve_gate
+            # has at most ~320 params and all other matrix shapes (model_dim, 4*model_dim)
+            # are always divisible by 8 as model_dim = n_head * head_dim = n_head * 128.
             if distributed_strategy == "fsdp" and shape[0] % world_size != 0:
                 param_groups.append(dict(
                     kind='adamw', params=group_params, lr=matrix_lr,
