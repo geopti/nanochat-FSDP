@@ -44,6 +44,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
 parser.add_argument("--distributed-strategy", type=str, default="ddp", choices=["ddp", "fsdp"], help="distributed training strategy: ddp (default) or fsdp (FSDP2 for 7B+ models)")
+parser.add_argument("--activation-checkpointing", action="store_true", help="recompute activations during backward to save memory at the cost of ~33%% extra compute (recommended for d40+ with fsdp)")
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
@@ -170,14 +171,14 @@ if args.distributed_strategy == "fsdp":
     from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
     model.bfloat16()  # FSDP requires uniform dtype; some params (wte, value_embeds) init as bf16 on CUDA
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    # Enable activation checkpointing on all transformer blocks
-    for block in model.transformer.h:
-        block._use_activation_checkpointing = True
     # Apply FSDP2 bottom-up: per-block first, then root wraps remaining params (embeddings, lm_head, scalars)
     for block in model.transformer.h:
+        if args.activation_checkpointing:
+            block._use_activation_checkpointing = True
         fully_shard(block, mp_policy=mp_policy)
     fully_shard(model, mp_policy=mp_policy)
-    print0(f"✓ FSDP2 enabled: model sharded across {ddp_world_size} GPUs with activation checkpointing")
+    ac_str = " + activation checkpointing" if args.activation_checkpointing else ""
+    print0(f"✓ FSDP2 enabled: model sharded across {ddp_world_size} GPUs{ac_str}")
 
     # If resuming, load checkpoint into FSDP model using distributed state dict utilities
     if resuming:
@@ -590,6 +591,11 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if device_type == "cuda" and step == 30:
+        mem_alloc = torch.cuda.memory_allocated(device) / 1024**3
+        mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+        mem_peak = torch.cuda.max_memory_allocated(device) / 1024**3
+        print0(f"  GPU memory (rank 0) — allocated: {mem_alloc:.2f} GB | reserved: {mem_reserved:.2f} GB | peak: {mem_peak:.2f} GB")
     if step % 100 == 0:
         log_data = {
             "step": step,
