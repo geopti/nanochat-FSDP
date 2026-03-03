@@ -169,7 +169,7 @@ if resuming:
 
 if args.distributed_strategy == "fsdp":
     from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-    model.bfloat16()  # FSDP requires uniform dtype; some params (wte, value_embeds) init as bf16 on CUDA
+    model.float()  # FP32 master weights: keep params in FP32; MixedPrecisionPolicy handles BF16 for compute
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     # Apply FSDP2 bottom-up: per-block first, then root wraps remaining params (embeddings, lm_head, scalars)
     for block in model.transformer.h:

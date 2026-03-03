@@ -589,8 +589,10 @@ def _fsdp_muon_ns_and_update(
     g = g * final_scale.to(g.dtype)
 
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
+    # Cast g to param dtype: with FP32 master weights stacked_params is FP32 but g is BF16
+    g = g.to(stacked_params.dtype)
+    lr = lr_t.to(stacked_params.dtype)
+    wd = wd_t.to(stacked_params.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
